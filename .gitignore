@@ -39,3 +39,6 @@ Thumbs.db
 
 # Local-only docs
 docs/
+
+# keep the prebuilt SketchUp installer
+!su_mcp.rbz

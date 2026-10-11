@@ -45,30 +45,36 @@ uv sync
 
 The extension runs a small TCP server inside SketchUp (port 9876).
 
-1. Make an `.rbz` file: zip `su_mcp.rb` and the `su_mcp` folder together, with `su_mcp.rb` at the
-   top level of the zip, then rename the zip to `su_mcp.rbz`. (Or use a prebuilt `.rbz` if you have one.)
+1. Use the prebuilt `su_mcp.rbz` in the root of this repository. (To rebuild it from source, run
+   `powershell -ExecutionPolicy Bypass -File .\build-rbz.ps1`.)
 2. In SketchUp, go to Window > Extension Manager.
-3. Click "Install Extension" and select the `.rbz` file.
+3. Click "Install Extension" and select `su_mcp.rbz`.
 4. Restart SketchUp.
-5. Go to Extensions > SketchupMCP > Start Server. Do this each time you open SketchUp.
+5. Go to Extensions > MCP Server > Start Server. Do this each time you open SketchUp.
 
 ### 4. Pick how Claude connects
 
 **Option A: Claude on the same PC (stdio, simplest)**
 
-Add this to your Claude configuration, using the full path to the cloned folder:
+With Claude Code, run this once (it needs no clone):
+
+```bash
+claude mcp add sketchup -- uvx --from git+https://github.com/forceki/sketchup-mcp-remote sketchup-mcp
+```
+
+Or add this to your Claude Desktop configuration:
 
 ```json
 "mcpServers": {
     "sketchup": {
-        "command": "uv",
-        "args": ["run", "--directory", "C:\\path\\to\\sketchup-mcp-remote", "sketchup-mcp"]
+        "command": "uvx",
+        "args": ["--from", "git+https://github.com/forceki/sketchup-mcp-remote", "sketchup-mcp"]
     }
 }
 ```
 
-Do not use `uvx sketchup-mcp` with this fork. That installs the original version from PyPI,
-which has no HTTP mode.
+Do not use plain `uvx sketchup-mcp`. That installs the original version from PyPI, which has
+no HTTP mode.
 
 **Option B: Claude on another machine such as a VPS (HTTP over Tailscale)**
 
@@ -84,7 +90,7 @@ See [Remote use over HTTP](#remote-use-over-http-vps--tailscale) below.
 
 ### Starting the Connection
 
-1. In Sketchup, go to Extensions > SketchupMCP > Start Server
+1. In Sketchup, go to Extensions > MCP Server > Start Server
 2. The server will start on the default port (9876)
 3. Make sure the MCP server is running in your terminal
 
