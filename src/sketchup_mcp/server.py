@@ -103,10 +103,7 @@ class SketchupConnection:
 
     def send_command(self, method: str, params: Dict[str, Any] = None, request_id: Any = None) -> Dict[str, Any]:
         """Send a JSON-RPC request to Sketchup and return the response"""
-        # Try to connect if not connected
-        if not self.connect():
-            raise ConnectionError("Not connected to Sketchup")
-        
+
         # Ensure we're sending a proper JSON-RPC request
         if method == "tools/call" and params and "name" in params and "arguments" in params:
             # This is already in the correct format
@@ -146,14 +143,20 @@ class SketchupConnection:
                 request_bytes = json.dumps(request).encode('utf-8') + b'\n'
                 logger.info(f"Raw bytes being sent: {request_bytes}")
                 
+                # The SketchUp extension answers exactly one request per connection
+                # and then closes it, so open a fresh connection for every request.
+                self.disconnect()
+                if not self.connect():
+                    raise ConnectionError("Not connected to Sketchup")
                 self.sock.sendall(request_bytes)
                 logger.info(f"Request sent, waiting for response...")
-                
+
                 self.sock.settimeout(15.0)
-                
+
                 response_data = self.receive_full_response(self.sock)
                 logger.info(f"Received {len(response_data)} bytes of data")
-                
+                self.disconnect()
+
                 response = json.loads(response_data.decode('utf-8'))
                 logger.info(f"Response parsed: {response}")
 
@@ -199,32 +202,22 @@ def get_sketchup_connection():
     """Get or create a persistent Sketchup connection"""
     global _sketchup_connection
     
+    # No ping here: the extension does not know "ping", and its unread
+    # "Method not found" reply used to be mistaken for the next command's answer.
+    # send_command opens a fresh connection per request anyway.
     if _sketchup_connection is not None:
-        try:
-            # Test connection with a ping command
-            ping_request = {
-                "jsonrpc": "2.0",
-                "method": "ping",
-                "params": {},
-                "id": 0
-            }
-            _sketchup_connection.sock.sendall(json.dumps(ping_request).encode('utf-8') + b'\n')
-            return _sketchup_connection
-        except Exception as e:
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _sketchup_connection.disconnect()
-            except:
-                pass
-            _sketchup_connection = None
-    
+        return _sketchup_connection
+
     if _sketchup_connection is None:
         _sketchup_connection = SketchupConnection(host="localhost", port=9876)
         if not _sketchup_connection.connect():
             logger.error("Failed to connect to Sketchup")
             _sketchup_connection = None
             raise Exception("Could not connect to Sketchup. Make sure the Sketchup extension is running.")
-        logger.info("Created new persistent connection to Sketchup")
+        # Close the test connection right away: an idle open connection blocks the
+        # extension, which waits for a request line on SketchUp's main loop.
+        _sketchup_connection.disconnect()
+        logger.info("Sketchup is reachable")
     
     return _sketchup_connection
 
