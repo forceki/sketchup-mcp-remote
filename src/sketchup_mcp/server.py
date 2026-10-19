@@ -12,6 +12,10 @@ logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SketchupMCPServer")
 
+import os as _os
+# Seconds to wait for SketchUp to answer one command (KUAS builds can take a while).
+SKETCHUP_TIMEOUT = float(_os.environ.get("SKETCHUP_MCP_TIMEOUT", "120"))
+
 # Define version directly to avoid pkg_resources dependency
 __version__ = "0.1.17"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
@@ -58,7 +62,7 @@ class SketchupConnection:
     def receive_full_response(self, sock, buffer_size=8192):
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
-        sock.settimeout(15.0)
+        sock.settimeout(SKETCHUP_TIMEOUT)
         
         try:
             while True:
@@ -151,7 +155,7 @@ class SketchupConnection:
                 self.sock.sendall(request_bytes)
                 logger.info(f"Request sent, waiting for response...")
 
-                self.sock.settimeout(15.0)
+                self.sock.settimeout(SKETCHUP_TIMEOUT)
 
                 response_data = self.receive_full_response(self.sock)
                 logger.info(f"Received {len(response_data)} bytes of data")
@@ -568,6 +572,190 @@ def eval_ruby(
             "success": False,
             "error": str(e)
         })
+
+# ---------------------------------------------------------------------------
+# Tools for remote agents (KUAS workflow): model inspection, images and a
+# small project folder for specs. The agent may run on another machine, so
+# images are returned as MCP image content instead of local file paths.
+# ---------------------------------------------------------------------------
+import os
+import re
+import tempfile
+from pathlib import Path
+from mcp.server.fastmcp import Image
+
+WORK_DIR = Path(os.environ.get("SKETCHUP_MCP_WORKDIR", Path.home() / "sketchup-connector" / "work"))
+KUAS_DIR = Path(os.environ.get("SKETCHUP_KUAS_DIR", Path.home() / "sketchup-connector" / "kuas"))
+PROJECT_FILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,120}\.(json|md|txt)$")
+IMAGE_NAME_RE = re.compile(r"^(kuas|mcp)_[A-Za-z0-9_.-]+\.png$")
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+def _ruby(ctx: Context, code: str) -> str:
+    """Run Ruby in SketchUp and return its result as text; raise on failure."""
+    result = get_sketchup_connection().send_command(
+        method="tools/call",
+        params={"name": "eval_ruby", "arguments": {"code": code}},
+        request_id=ctx.request_id,
+    )
+    if isinstance(result, dict) and result.get("isError"):
+        raise RuntimeError(str(result.get("content")))
+    content = result.get("content") if isinstance(result, dict) else None
+    if isinstance(content, list) and content:
+        return content[0].get("text", "")
+    return ""
+
+
+def _allowed_image(path: str) -> Path:
+    p = Path(os.path.realpath(path))
+    roots = [Path(os.path.realpath(tempfile.gettempdir())), Path(os.path.realpath(WORK_DIR))]
+    if not IMAGE_NAME_RE.match(p.name) or not any(r == p.parent or r in p.parents for r in roots):
+        raise ValueError("only KUAS/MCP PNG images in the temp or work folder can be read")
+    if not p.is_file():
+        raise FileNotFoundError(f"image not found: {p.name}")
+    if p.stat().st_size > MAX_IMAGE_BYTES:
+        raise ValueError("image too large (max 8 MB); use a smaller crop or scale")
+    return p
+
+
+def _project_file(name: str) -> Path:
+    if not PROJECT_FILE_RE.match(name or ""):
+        raise ValueError("name must be a plain file name ending in .json, .md or .txt (letters, digits, _ . -)")
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    return WORK_DIR / name
+
+
+MODEL_INFO_RUBY = r"""
+require 'json'
+m = Sketchup.active_model
+mm = lambda { |v| (v.to_f * 25.4).round(1) }
+bb = lambda { |b| [mm.(b.min.x), mm.(b.min.y), mm.(b.min.z), mm.(b.max.x), mm.(b.max.y), mm.(b.max.z)] }
+short = lambda { |v| s = v.to_s; s.size > 200 ? s[0, 200] + '...' : v }
+kuas = lambda do |e|
+  d = e.attribute_dictionary('kuas')
+  d ? d.to_h.transform_values { |v| short.(v) } : nil
+end
+ents = m.entities
+units = (m.options['UnitsOptions']['LengthUnit'] rescue nil)
+{
+  title: m.title, path: m.path, modified: m.modified?,
+  length_unit: ({0 => 'inches', 1 => 'feet', 2 => 'mm', 3 => 'cm', 4 => 'm'}[units] || units),
+  root_entities: ents.size,
+  groups: ents.select { |e| e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance) }.first(300).map { |e|
+    { pid: e.persistent_id, type: e.class.name.split('::').last, name: e.name,
+      definition: e.definition.name, tag: e.layer.name, hidden: e.hidden?, bbox_mm: bb.(e.bounds), kuas: kuas.(e) }
+  },
+  images: ents.grep(Sketchup::Image).map { |i|
+    { pid: i.persistent_id, path: i.path, tag: i.layer.name, hidden: i.hidden?,
+      pixels: [i.pixelwidth, i.pixelheight], bbox_mm: bb.(i.bounds) }
+  },
+  tags: m.layers.map { |l| { name: l.name, visible: l.visible? } },
+  scenes: m.pages.map(&:name),
+  selection_count: m.selection.size,
+  kuas_loaded: (defined?(Kuas) && Kuas.respond_to?(:version)) ? Kuas.version : nil
+}.to_json
+"""
+
+
+@mcp.tool()
+def get_model_info(ctx: Context) -> str:
+    """Describe the active SketchUp model: title/path, units, top-level groups/components
+    (persistent id, name, tag, bbox in mm, KUAS attributes), imported reference images,
+    tags, scenes and the loaded KUAS version. Read-only."""
+    try:
+        info = json.loads(_ruby(ctx, MODEL_INFO_RUBY))
+        info["kuas_dir"] = KUAS_DIR.as_posix()
+        info["work_dir"] = WORK_DIR.as_posix()
+        return json.dumps(info)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@mcp.tool()
+def load_kuas(ctx: Context) -> str:
+    """Load (or reload) the KUAS Ruby tools into SketchUp from the folder the connector keeps
+    up to date, and return Kuas.version. Call this before using any Kuas.* method."""
+    try:
+        entry = KUAS_DIR / "kuas_tools.rb"
+        if not entry.is_file():
+            raise FileNotFoundError(f"KUAS tools not found in {KUAS_DIR}; restart the connector to sync them")
+        path = entry.as_posix().replace("\\", "\\\\").replace("'", "\\'")
+        version = _ruby(ctx, f"load '{path}'; Kuas.version")
+        return json.dumps({"success": True, "version": version.strip().strip('"'), "kuas_dir": KUAS_DIR.as_posix()})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@mcp.tool()
+def get_viewport_screenshot(ctx: Context, width: int = 1400):
+    """Capture the current SketchUp view and return it as a PNG image (width 400-2000 px).
+    Does not change the camera or the model."""
+    width = max(400, min(int(width), 2000))
+    code = (
+        "require 'tmpdir'; v = Sketchup.active_model.active_view; "
+        f"w = {width}; h = (w * v.vpheight / v.vpwidth.to_f).round; "
+        "path = File.join(Dir.tmpdir, \"mcp_view_#{Time.now.to_i}_#{rand(99999)}.png\"); "
+        "v.write_image(filename: path, width: w, height: h, antialias: true, transparent: false); path"
+    )
+    try:
+        p = _allowed_image(_ruby(ctx, code).strip().strip('"'))
+        data = p.read_bytes()
+        p.unlink(missing_ok=True)
+        return Image(data=data, format="png")
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@mcp.tool()
+def get_image(ctx: Context, path: str):
+    """Return a PNG written by KUAS (e.g. Kuas.image_crop / view_region / overlay_check, files named
+    kuas_*.png in the temp folder) as an image so a remote agent can see it."""
+    try:
+        return Image(data=_allowed_image(path).read_bytes(), format="png")
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@mcp.tool()
+def put_project_file(ctx: Context, name: str, content: str, overwrite: bool = False) -> str:
+    """Save a spec/mapping/report (.json, .md or .txt) in the project work folder on the SketchUp
+    computer and return its absolute path for KUAS Ruby calls. JSON is validated. Existing files
+    are kept unless overwrite=true (KUAS runs/passes should use new names)."""
+    try:
+        p = _project_file(name)
+        if name.endswith(".json"):
+            json.loads(content)
+        if p.exists() and not overwrite:
+            raise FileExistsError(f"{name} already exists; use a new run/pass name or overwrite=true")
+        p.write_text(content, encoding="utf-8")
+        return json.dumps({"success": True, "path": p.as_posix(), "bytes": p.stat().st_size})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@mcp.tool()
+def get_project_file(ctx: Context, name: str) -> str:
+    """Read a file from the project work folder on the SketchUp computer."""
+    try:
+        p = _project_file(name)
+        return json.dumps({"success": True, "path": p.as_posix(), "content": p.read_text(encoding="utf-8")})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@mcp.tool()
+def list_project_files(ctx: Context) -> str:
+    """List files in the project work folder on the SketchUp computer (name, size, modified)."""
+    try:
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        files = [
+            {"name": f.name, "bytes": f.stat().st_size, "modified": int(f.stat().st_mtime)}
+            for f in sorted(WORK_DIR.iterdir()) if f.is_file()
+        ]
+        return json.dumps({"success": True, "folder": WORK_DIR.as_posix(), "files": files})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
 
 def main():
     # Default is stdio. Set SKETCHUP_MCP_TRANSPORT=streamable-http (with
