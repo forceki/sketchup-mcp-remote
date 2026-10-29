@@ -42,3 +42,9 @@ docs/
 
 # keep the prebuilt SketchUp installer
 !su_mcp.rbz
+
+# connector runtime files
+connector/connector.json
+connector/connector.log
+connector/kuas/
+connector/work/

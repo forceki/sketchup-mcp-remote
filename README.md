@@ -155,6 +155,11 @@ claude mcp add --scope project --transport http sketchup http://<PC_TAILSCALE_IP
 The server has **no authentication**. Bind it to a private network (Tailscale) only and never
 expose it publicly. See [CHANGES.md](CHANGES.md) for what differs from upstream.
 
+## Connector for the SketchUp Claude website
+
+The `connector/` folder contains the connector and the one-line installers used by the
+SketchUp Claude website (**+ Add computer**). See [connector/README.md](connector/README.md).
+
 ## Credits
 
 Based on [mhyrr/sketchup-mcp](https://github.com/mhyrr/sketchup-mcp), MIT licensed.
